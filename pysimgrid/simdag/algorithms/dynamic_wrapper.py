@@ -109,19 +109,18 @@ class DynamicWrapperV2(scheduler.DynamicScheduler):
             for h in t.hosts:
                 self.hosts_status[h] = True
                 self.hosts_eat[h].pop(0)
+                #print('Task done', [_t for _t in self._simulation.tasks].index(t), self.tasks_ect[t], self._simulation.clock)
                 self.tasks_ect[t] = self._simulation.clock
+                #print('Task done', [_t for _t in self._simulation.tasks].index(t), self._simulation.clock)
 
     def __schedule_to_free_hosts(self, schedule, hosts_status):
-        #platform_model = cscheduling.PlatformModel(self.simulation)
-        #state = cscheduling.SchedulerState(self.simulation)
-        #nxgraph = simulation.get_task_graph()
         for host, tasks in schedule.items():
             if tasks and hosts_status[host] == True:
                 task = tasks.pop(0)
                 task.schedule(host)
                 hosts_status[host] = False
                 self.done_tasks.add(task)
-                print([_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host))
+                #print([_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host), self._simulation.clock)
 
 
 def _est(host, parents, platform_model, task_host, tasks_ect, hosts):
@@ -194,14 +193,21 @@ class DynamicHEFT(scheduler.StaticScheduler):
                 best_eft = None
                 host_to_schedule = None
                 for host in simulation.hosts:
-                    #est = platform_model.est(host, dict(nxgraph.pred[task]), state)
-                    est1 = _all_parents_done_time(dict(nxgraph.pred[task]), tasks_ect)
+                    if task.name != 'root' and task.name != 'end' and cscheduling.is_master_host(host):
+                        continue
+                    if (task.name == 'root' or task.name == 'end') and not(cscheduling.is_master_host(host)):
+                        continue
+                    """est1 = _all_parents_done_time(dict(nxgraph.pred[task]), tasks_ect)
                     est2 = _comm_time(host, dict(nxgraph.pred[task]), platform_model, task_host, [_host for _host in simulation.hosts])
-                    time_start = est1
+                    time_start = est1 + est2
                     if len(hosts_eat[host]) > 0:
                         time_start = max(time_start, hosts_eat[host][-1])
-                    time_start += est2
-                    
+                    time_start += est2"""
+                    time_start = _est(host, dict(nxgraph.pred[task]), platform_model, task_host, tasks_ect, [_host for _host in simulation.hosts])
+                    if len(hosts_eat[host]) > 0:
+                        time_start = max(time_start, hosts_eat[host][-1])
+                    time_start = max(time_start, simulation.clock)
+
                     eet = platform_model.eet(task, host)
                     eft = time_start + eet
                     if host_to_schedule is None or best_eft > eft:
@@ -211,5 +217,13 @@ class DynamicHEFT(scheduler.StaticScheduler):
                 task_host[task] = host_to_schedule
                 tasks_ect[task] = best_eft
                 hosts_eat[host_to_schedule].append(best_eft)
-
-        return schedule, None
+                #print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host_to_schedule))
+                #for parent, edge_dict in dict(nxgraph.pred[task]).items():
+                #    print([_t for _t in simulation.tasks].index(parent), edge_dict['weight'], tasks_ect[parent])
+                #print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host_to_schedule), best_eft)
+        expected_makespan = max(tasks_ect.values())
+        #print(expected_makespan)
+        #for host in schedule:
+        #    for task in schedule[host]:
+        #        print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host))
+        return schedule, expected_makespan

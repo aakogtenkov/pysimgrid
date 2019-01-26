@@ -5,6 +5,7 @@ import collections
 import logging
 import networkx
 import os
+import copy
 
 class DynamicSimulation(sim.Simulation):
     def __init__(self, platform, tasks, config=None, log_config=None):
@@ -94,32 +95,38 @@ class DynamicWrapperV2(scheduler.DynamicScheduler):
 
     def prepare(self, simulation):
         self.hosts_status = {h: True for h in self._simulation.hosts}
-        self.hosts_eat = {h: [] for h in self._simulation.hosts} #available time estimation
+        self.hosts_eat = {h: [] for h in self._simulation.hosts} #(start_time, end_time) for tasks on host
+        self._schedule = {h: [] for h in self._simulation.hosts}
 
     def schedule(self, simulation, changed):
         self.step_counter += 1
         if self.step_counter >= self.reschedule_frequency:
             self.step_counter = 0
-            self._schedule, expected_makespan = self.static_scheduler.get_schedule(simulation, self.done_tasks, self.hosts_eat, self.task_host, self.tasks_ect)
+            #drop old estimations
+            for host in self.hosts_eat.keys():
+                self.hosts_eat[host] = self.hosts_eat[host][:1]
+                self._schedule[host] = self._schedule[host][:1]
+            self._schedule, expected_makespan = self.static_scheduler.get_schedule(simulation, self.done_tasks, self.hosts_eat, self.task_host, self.tasks_ect, self._schedule)
         self.__update_host_status(self.hosts_status, changed)
         self.__schedule_to_free_hosts(self._schedule, self.hosts_status)
 
     def __update_host_status(self, hosts_status, changed):
         for t in changed.by_prop("kind", csimdag.TASK_KIND_COMM_E2E, True)[csimdag.TASK_STATE_DONE]:
             for h in t.hosts:
+                self._schedule[h].remove(t)
                 self.hosts_status[h] = True
                 self.hosts_eat[h].pop(0)
                 #print('Task done', [_t for _t in self._simulation.tasks].index(t), self.tasks_ect[t], self._simulation.clock)
                 self.tasks_ect[t] = self._simulation.clock
-                #print('Task done', [_t for _t in self._simulation.tasks].index(t), self._simulation.clock)
 
     def __schedule_to_free_hosts(self, schedule, hosts_status):
         for host, tasks in schedule.items():
             if tasks and hosts_status[host] == True:
-                task = tasks.pop(0)
+                task = tasks[0]
                 task.schedule(host)
                 hosts_status[host] = False
                 self.done_tasks.add(task)
+                self.hosts_eat[host][0] = (-1, self.hosts_eat[host][0][1]) #to prevent timesheet insertion before executing task
                 #print([_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host), self._simulation.clock)
 
 
@@ -162,13 +169,25 @@ def _comm_time(host, parents, platform_model, task_host, hosts):
             result = parent_time
     return result
 
+def timesheet_insertion_place(timesheet, time_start, eet):
+    if len(timesheet) == 0:
+        return 0, time_start, time_start + eet
+    if timesheet[0][0] >= time_start + eet:
+        return 0, time_start, time_start + eet
+    for i in range(1, len(timesheet)):
+        start_time = max(time_start, timesheet[i - 1][1])
+        if start_time + eet <= timesheet[i][0]:
+            return i, start_time, start_time + eet
+    start_time = max(time_start, timesheet[-1][1])
+    return len(timesheet), start_time, start_time + eet
+
 
 class DynamicHEFT(scheduler.StaticScheduler):
     def __init__(self, simulation):
         super(DynamicHEFT, self).__init__(simulation)
         self.ordered_tasks = None
 
-    def get_schedule(self, simulation, done_tasks, hosts_eat, task_host, tasks_ect, schedule_k=-1):
+    def get_schedule(self, simulation, done_tasks, hosts_eat, task_host, tasks_ect, schedule, schedule_k=-1):
         """
         Overriden.
         """
@@ -182,16 +201,24 @@ class DynamicHEFT(scheduler.StaticScheduler):
         if schedule_k < 0:
             schedule_k = len(self.ordered_tasks)
 
-        schedule = {host: [] for host in simulation.hosts}
+        #print(hosts_eat)
+        #schedule = {host: [None] * len(hosts_eat[host]) for host in simulation.hosts}
+        #for host in simulation.hosts:
+        #    print(schedule[host], hosts_eat[host])
+        #print(schedule)
 
-        #drop old estimations
-        for host in hosts_eat.keys():
-            hosts_eat[host] = hosts_eat[host][:1]
+        done_tasks2 = set()
+        for h in schedule.keys():
+            for task in schedule[h]:
+                done_tasks2.add(task)
+        done_tasks2 |= done_tasks
 
         for task in self.ordered_tasks:
-            if not task in done_tasks:
+            if not task in done_tasks2:
                 best_eft = None
                 host_to_schedule = None
+                best_start = None
+                best_pos = None
                 for host in simulation.hosts:
                     if task.name != 'root' and task.name != 'end' and cscheduling.is_master_host(host):
                         continue
@@ -204,24 +231,129 @@ class DynamicHEFT(scheduler.StaticScheduler):
                         time_start = max(time_start, hosts_eat[host][-1])
                     time_start += est2"""
                     time_start = _est(host, dict(nxgraph.pred[task]), platform_model, task_host, tasks_ect, [_host for _host in simulation.hosts])
-                    if len(hosts_eat[host]) > 0:
-                        time_start = max(time_start, hosts_eat[host][-1])
                     time_start = max(time_start, simulation.clock)
-
                     eet = platform_model.eet(task, host)
-                    eft = time_start + eet
+
+                    pos, time_start, eft = timesheet_insertion_place(hosts_eat[host], time_start, eet)
+
+                    #if len(hosts_eat[host]) > 0:
+                    #    time_start = max(time_start, hosts_eat[host][-1])
+
+                    #eft = time_start + eet
                     if host_to_schedule is None or best_eft > eft:
                         best_eft = eft
                         host_to_schedule = host
-                schedule[host_to_schedule].append(task)
+                        best_start = time_start
+                        best_pos = pos
+                schedule[host_to_schedule].insert(best_pos, task)
                 task_host[task] = host_to_schedule
                 tasks_ect[task] = best_eft
-                hosts_eat[host_to_schedule].append(best_eft)
+                hosts_eat[host_to_schedule].insert(best_pos, (best_start, best_eft))
+                #hosts_eat[host_to_schedule].append(best_eft)
+
                 #print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host_to_schedule))
                 #for parent, edge_dict in dict(nxgraph.pred[task]).items():
                 #    print([_t for _t in simulation.tasks].index(parent), edge_dict['weight'], tasks_ect[parent])
-                #print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host_to_schedule), best_eft)
+                #print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host_to_schedule), best_start, best_eft)
         expected_makespan = max(tasks_ect.values())
+        #print()
+        #print(expected_makespan)
+        #for host in schedule:
+        #    for task in schedule[host]:
+        #        print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host))
+        return schedule, expected_makespan
+
+class DynamicLookahead(scheduler.StaticScheduler):
+    def __init__(self, simulation):
+        super(DynamicLookahead, self).__init__(simulation)
+        self.ordered_tasks = None
+        self.heft = DynamicHEFT(simulation)
+
+    def _copy_schedule(self, schedule):
+        schedule_copy = dict()
+        for h in schedule.keys():
+            schedule_copy[h] = []
+            for i in range(len(schedule[h])):
+                schedule_copy[h].append(schedule[h][i])
+        return schedule_copy
+
+    def _copy_task_host(self, task_host):
+        task_host_copy = dict()
+        for h in task_host.keys():
+            task_host_copy[h] = task_host[h]
+        return task_host_copy
+
+    def get_schedule(self, simulation, done_tasks, hosts_eat, task_host, tasks_ect, schedule, schedule_k=-1):
+        nxgraph = simulation.get_task_graph()
+        platform_model = cscheduling.PlatformModel(simulation)
+        state = cscheduling.SchedulerState(simulation)
+
+        if self.ordered_tasks is None:
+            self.ordered_tasks = cscheduling.heft_order(nxgraph, platform_model)
+
+        if schedule_k < 0:
+            schedule_k = len(self.ordered_tasks)
+
+        done_tasks2 = set()
+        for h in schedule.keys():
+            for task in schedule[h]:
+                done_tasks2.add(task)
+        done_tasks2 |= done_tasks
+
+        for task in self.ordered_tasks:
+            if not task in done_tasks2:
+                best_expected_makespan = None
+                best_eft = None
+                host_to_schedule = None
+                best_start = None
+                best_pos = None
+                for host in simulation.hosts:
+                    if task.name != 'root' and task.name != 'end' and cscheduling.is_master_host(host):
+                        continue
+                    if (task.name == 'root' or task.name == 'end') and not(cscheduling.is_master_host(host)):
+                        continue
+
+                    time_start = _est(host, dict(nxgraph.pred[task]), platform_model, task_host, tasks_ect, [_host for _host in simulation.hosts])
+                    time_start = max(time_start, simulation.clock)
+                    eet = platform_model.eet(task, host)
+
+                    pos, time_start, eft = timesheet_insertion_place(hosts_eat[host], time_start, eet)
+
+                    hosts_eat[host].insert(pos, (time_start, eft))
+                    tasks_ect[task] = eft
+                    task_host[task] = host
+                    schedule[host].insert(pos, task)
+
+                    _, expected_makespan = self.heft.get_schedule(simulation, done_tasks, 
+                                                                  self._copy_schedule(hosts_eat), 
+                                                                  self._copy_task_host(task_host), 
+                                                                  self._copy_task_host(tasks_ect), 
+                                                                  self._copy_schedule(schedule))
+                    #print(expected_makespan, [_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host), schedule, hosts_eat)
+
+                    if host_to_schedule is None or expected_makespan < best_expected_makespan:
+                        best_eft = eft
+                        host_to_schedule = host
+                        best_start = time_start
+                        best_pos = pos
+                        best_expected_makespan = expected_makespan
+
+                    hosts_eat[host].pop(pos)
+                    tasks_ect[task] = 0
+                    task_host[task] = None
+                    schedule[host].pop(pos)
+
+                schedule[host_to_schedule].insert(best_pos, task)
+                task_host[task] = host_to_schedule
+                tasks_ect[task] = best_eft
+                hosts_eat[host_to_schedule].insert(best_pos, (best_start, best_eft))
+
+                #print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host_to_schedule))
+                #for parent, edge_dict in dict(nxgraph.pred[task]).items():
+                #    print([_t for _t in simulation.tasks].index(parent), edge_dict['weight'], tasks_ect[parent])
+                #print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host_to_schedule), best_start, best_eft, best_expected_makespan)
+        expected_makespan = max(tasks_ect.values())
+        #print()
         #print(expected_makespan)
         #for host in schedule:
         #    for task in schedule[host]:

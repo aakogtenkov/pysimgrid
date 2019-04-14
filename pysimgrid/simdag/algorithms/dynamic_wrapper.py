@@ -9,6 +9,7 @@ import copy
 import numpy as np
 from collections import deque
 import operator
+import time
 
 def _all_parents_done_time(parents, tasks_status):
     result = 0.
@@ -90,8 +91,23 @@ class StepTrigger():
         self.c = steps + 1
         self.steps = steps
 
-    def trigger(self):
+    def trigger(self, tasks_status):
         self.c += 1
+        if self.c > self.steps:
+            self.c = 1
+            return True
+        return False
+
+class ParallelTrigger(StepTrigger):
+    def __init__(self, steps=1):
+        self.c = steps + 1
+        self.steps = steps
+
+    def trigger(self, tasks_status):
+        self.c += 1
+        for task in tasks_status:
+            if 'rescheduling' in task.name and tasks_status[task][0] != 'done':
+                return False
         if self.c > self.steps:
             self.c = 1
             return True
@@ -112,22 +128,46 @@ class SimpleSchedulePartitioner():
         return new_schedule
 
 class ParallelSchedulePartitioner():
-    def __init__(self):
-        pass
+    # Warning: this partitioner returns final schedule!
+
+    def __init__(self, scheduler, simulation):
+        self.scheduler = scheduler
+        self.simulation = simulation
 
     def freeze(self, schedule, tasks_status, hosts_status, task_graph, min_start_time=0):
         new_schedule = Schedule(schedule.get_schedule().keys())
+        scheduled_tasks = set()
+
+        #partitioning
         for host in schedule.get_schedule().keys():
             for task, start_time, end_time in schedule.get_schedule()[host]:
                 status, h, ect = tasks_status[task]
                 if status == 'running' or status == 'done' or start_time < min_start_time:
                     new_schedule._append(task, host, -1, ect)
+                    scheduled_tasks.add(task)
+
+        # rescheduling
+        start_time = time.time()
+        new_schedule, _ = self.scheduler.get_schedule(new_schedule, task_graph, tasks_status)
+        scheduling_time = time.time() - start_time    # in sec
+
+        # adding rescheduling task
         for host in schedule.get_schedule().keys():
             if cscheduling.is_master_host(host):
-                pass
-                # insert task for master node with complexity ~ scheduling time
-                # (issue: need to schedule other part before it?)
+                rescheduling_task = self.simulation.add_task("rescheduling" + str(start_time), 1)   # default amount, should be replaced in future
+                for task in self.simulation.tasks:
+                    if not task in scheduled_tasks and task != rescheduling_task and task.name != 'root':
+                        #print(task.name)
+                        self.simulation.add_dependency(rescheduling_task, task)
+                    elif task.name == 'root' and tasks_status[task][0] != 'done':
+                        self.simulation.add_dependency(task, rescheduling_task)
+                new_schedule._append(rescheduling_task, host, -1, self.simulation.clock)
+                tasks_status[rescheduling_task] = ('scheduled', host, self.simulation.clock)
                 break
+        
+        #for host in new_schedule._schedule:
+        #    for task, _, _ in new_schedule._schedule[host]:
+        #        print([_t for _t in self.simulation.tasks].index(task), [_h for _h in self.simulation.hosts].index(host))
         return new_schedule
 
 
@@ -148,9 +188,10 @@ class DynamicWrapper(scheduler.DynamicScheduler):
 
     def schedule(self, simulation, changed):
         self.__update_host_status(changed)
-        reschedule = self.trigger.trigger()
+        reschedule = self.trigger.trigger(self.tasks_status)
         if reschedule:
-            self._schedule = self.schedule_partitioner.freeze(self._schedule, self.tasks_status, self.hosts_status, self.task_graph)
+            self._schedule = self.schedule_partitioner.freeze(self._schedule, self.tasks_status, self.hosts_status, self.task_graph, 10)
+            self.task_graph = self._simulation.get_task_graph() # for parallel partitioner that adds new task
             self._schedule, expected_makespan = self.static_scheduler.get_schedule(self._schedule, 
                                                                                    self.task_graph, 
                                                                                    self.tasks_status)
@@ -176,7 +217,8 @@ class DynamicWrapper(scheduler.DynamicScheduler):
                                     self.platform_model.eet(task, host) + 
                                     _comm_time(host, dict(self.task_graph[task]), self.platform_model, self.tasks_status))
                         self.tasks_status[task] = ('running', host, end_time)
-                        #print([_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host), self._simulation.clock)
+                        #print(host, [_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host), self._simulation.clock)
+                        break
 
 
 class DynamicHEFT(scheduler.StaticScheduler):

@@ -173,6 +173,26 @@ def get_clock():
   return csimdag.SD_get_clock()
 
 
+def add_dependency(csimdag.Task src, csimdag.Task dst):
+  """
+  Add dependency between given tasks, if not already exists.
+  """
+  cdef bytes utf8name = common.utf8_string("scheduled-after")
+  parents = set()
+  for parent in dst.parents:
+    parents.add(parent.name)
+  if src.name not in parents:
+    csimdag.SD_task_dependency_add(utf8name, NULL, src.impl, dst.impl)
+
+
+def add_task(name, amount):
+  """
+  Add computational task to SimDAG graph.
+  """
+  cdef bytes utf8name = common.utf8_string(name)
+  return Task.wrap(csimdag.SD_task_create_comp_seq(utf8name, NULL, amount));
+
+
 def exit():
   """
   Finalize simulator operation.
@@ -226,6 +246,21 @@ cdef class Task:
     self.__check_impl()
     if not host.impl:
       raise RuntimeError("host instance is invalid")
+    csimdag.SD_task_schedulev(self.impl, 1, &host.impl)
+
+  def schedule_after(self, cplatform.Host host not None, csimdag.Task predecessor not None):
+    """
+    Schedule this task to a given host after the predecessor task.
+    """
+    self.__check_impl()
+    if not host.impl:
+      raise RuntimeError("host instance is invalid")
+    parents = set()
+    for comm in self.parents:
+      parents.add(comm.parents[0].name)
+    cdef bytes utf8name = common.utf8_string("scheduled-after")
+    if predecessor.name not in parents and predecessor.state < TaskState.TASK_STATE_DONE:
+      csimdag.SD_task_dependency_add(utf8name, NULL, predecessor.impl, self.impl)
     csimdag.SD_task_schedulev(self.impl, 1, &host.impl)
 
   def get_eet(self, cplatform.Host host not None):
@@ -300,6 +335,31 @@ cdef class Task:
   def amount(self):
     """
     Get task 'size': flops for computational tasks, bytes for transfer tasks.
+    Real value is replaced by a possibly inaccurate estimate if set.
+    """
+    self.__check_impl()
+    if self.amount_estimate != -1:
+        return self.amount_estimate
+    else:
+        return csimdag.SD_task_get_amount(self.impl)
+
+  @property
+  def amount_estimate(self):
+    """
+    Get task amount estimate (possibly inaccurate)
+    """
+    self.__check_impl()
+    return self.amount_estimate
+
+  @amount_estimate.setter
+  def amount_estimate(self, amount_estimate):
+    self.__check_impl()
+    self.amount_estimate = amount_estimate
+
+  @property
+  def amount_real(self):
+    """
+    Get real (accurate) task amount
     """
     self.__check_impl()
     return csimdag.SD_task_get_amount(self.impl)
@@ -399,6 +459,7 @@ cdef class Task:
     Basic initialization.
     """
     self.impl = NULL
+    self.amount_estimate = -1
 
   def __check_impl(self):
     """

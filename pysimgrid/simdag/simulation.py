@@ -19,9 +19,12 @@
 import collections
 import logging
 import networkx
+import operator
 import os
 
+from .scheduler import TaskExecutionMode
 from .. import csimdag
+from .. import tools
 
 class Simulation(object):
   """
@@ -42,9 +45,10 @@ class Simulation(object):
     "network/model": "LV08"
   }
 
-  def __init__(self, platform, tasks, config=None, log_config=None):
+  def __init__(self, platform, tasks, estimator=tools.AccurateEstimator(), config=None, log_config=None):
     self._platform_src = platform
     self._tasks_src = tasks
+    self._estimator = estimator
     self._config = self._DEFAULT_CONFIG
     self._log_config = log_config
     if config:
@@ -70,7 +74,30 @@ class Simulation(object):
     """
     changed = csimdag.simulate(how_long)
     changed_ids = [t.native for t in changed]
-    return _TaskList([t for t in self._tasks if t.native in changed_ids])
+    changed_tasks = _TaskList([t for t in self._tasks if t.native in changed_ids])
+
+    self._logger.debug("%.6f ------------------------------------------------------------------" % self.clock)
+    for task in changed_tasks:
+        if task.kind == csimdag.TASK_KIND_COMP_SEQ:
+            if task.state == csimdag.TASK_STATE_DONE:
+                self._logger.debug("%20s: %s (%s, %.6f - %.6f)" %
+                                   (task.name, str(task.state), task.hosts[0].name, task.start_time, task.finish_time))
+            else:
+                self._logger.debug("%20s: %s (%s, %.6f)" %
+                                   (task.name, str(task.state), task.hosts[0].name, task.start_time))
+        else:
+            if task.state == csimdag.TASK_STATE_DONE:
+                self._logger.debug("%20s: %s (%s - %s, %.6f - %.6f)" %
+                                   (task.name, str(task.state), task.hosts[0].name,
+                                    (task.hosts[1].name if len(task.hosts) == 2 else task.hosts[0].name),
+                                    task.start_time, task.finish_time))
+            else:
+                self._logger.debug("%20s: %s (%s - %s, %.6f)" %
+                                   (task.name, str(task.state), task.hosts[0].name,
+                                    (task.hosts[1].name if len(task.hosts) == 2 else task.hosts[0].name),
+                                    task.start_time))
+
+    return changed_tasks
 
   def get_task_graph(self):
     """
@@ -89,6 +116,8 @@ class Simulation(object):
     for e in self.connections:
       parents, children = e.parents, e.children
       assert len(parents) == 1 and len(children) == 1
+      # make sure that the original task graph is not multigraph!
+      assert not graph.has_edge(parents[0], children[0])
       graph.add_edge(parents[0], children[0], weight=e.amount)
 
     return graph
@@ -135,6 +164,40 @@ class Simulation(object):
     """
     return csimdag.get_clock()
 
+  def add_dependency(self, src_task, dst_task):
+    """
+    Add dependency between given tasks, if not already exists.
+    """
+    csimdag.add_dependency(src_task, dst_task)
+
+  def add_task(self, name, amount):
+    """
+    Add computational task.
+    """
+    task = csimdag.add_task(name, amount)
+    sim_task = _SimulationTask(task.native, self, self._logger)
+    self._tasks.append(sim_task)
+    return sim_task
+
+  def sanity_check(self):
+    """
+    Check whether task executions overlap on hosts or not.
+    """
+    timetable_per_host = {}
+    for task in self.tasks:
+      host = task.hosts
+      assert(len(host) == 1)
+      if host[0].name not in timetable_per_host:
+        timetable_per_host[host[0].name] = []
+      timetable_per_host[host[0].name].append((task.start_time, task.finish_time))
+    for host in timetable_per_host:
+      last_ended = -1
+      for task_time in sorted(timetable_per_host[host], key=operator.itemgetter(0)):
+        if task_time[0] < last_ended:
+          return False
+        last_ended = task_time[1]
+    return True
+
   def __enter__(self):
     """
     Context interface implementation.
@@ -165,7 +228,13 @@ class Simulation(object):
     comm_tasks_count = len(self.connections)
     self._logger.debug("Tasks loaded, %d nodes, %d links", len(self._tasks) - comm_tasks_count, comm_tasks_count)
 
-    self._logger.info("Simulation initialized")
+    if self._estimator is not None:
+      for task in self.tasks:
+        if task.amount > 0:
+          task.amount_estimate = self._estimator.generate(task.amount)
+      self._logger.debug("Generated estimates using provided estimator")
+
+    self._logger.debug("Simulation initialized")
     Simulation._INSTANCE = self
     return self
 
@@ -173,7 +242,21 @@ class Simulation(object):
     """
     Context interface implementation.
     """
-    self._logger.info("Finalizing the simulation (clock: %.2f)", self.clock)
+    self._logger.debug("Finalizing the simulation (clock: %.2f)", self.clock)
+
+    # perform sanity check of produced execution
+    if "PYSIMGRID_TASK_EXECUTION" in os.environ:
+      task_exec_mode = TaskExecutionMode[os.environ["PYSIMGRID_TASK_EXECUTION"]]
+    else:
+      task_exec_mode = TaskExecutionMode.SEQUENTIAL
+    if task_exec_mode != TaskExecutionMode.PARALLEL:
+      if self.sanity_check():
+        self._logger.debug("Sanity check PASSED")
+      else:
+        raise Exception("Sanity check FAILED (task executions overlap on hosts!)")
+    else:
+      self._logger.debug("Sanity check SKIPPED (task execution mode is PARALLEL)")
+
     csimdag.exit()
     return False
 
@@ -200,8 +283,12 @@ class _SimulationTask(csimdag.Task):
     return self.__remap(super(_SimulationTask, self).parents, self._sim.all_tasks)
 
   def schedule(self, host):
-    self._logger.info("Scheduling task '%s' to host '%s'", self.name, host.name)
+    self._logger.debug("Scheduling task '%s' to host '%s'", self.name, host.name)
     super(_SimulationTask, self).schedule(host)
+
+  def schedule_after(self, host, predecessor):
+    self._logger.debug("Scheduling task '%s' to host '%s' after '%s'", self.name, host.name, predecessor.name)
+    super(_SimulationTask, self).schedule_after(host, predecessor)
 
   def __remap(self, internal_list, public_list):
     """

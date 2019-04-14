@@ -19,11 +19,69 @@
 import abc
 import itertools
 import logging
+import os
 import time
+
+from enum import Enum
 
 from .. import six
 from .. import csimdag
 from .. import cplatform
+
+
+class TaskExecutionMode(Enum):
+  """
+  Execution mode defines how tasks are executed on a host.
+
+  - SEQUENTIAL (default):
+    task are executed strictly one by one, in order specified by the scheduler.
+
+  - PARALLEL:
+    tasks can execute in parallel, host speed is fairly shared between concurrent tasks.
+  """
+  SEQUENTIAL = 1
+  PARALLEL = 2
+
+
+class DataTransferMode(Enum):
+  """
+  Data transfer strategy defines when and in what order data transfers, corresponding to edges in a workflow DAG,
+  are scheduled during the workflow execution. For each data transfer, the source task is called producer and
+  the destination task is called consumer. Applicable for SEQUENTIAL execution mode only.
+
+  - EAGER (default):
+    Data transfer is scheduled when the data is ready, i.e. the producer is completed,
+    and the destination node is known, i.e. the consumer is scheduled.
+
+  - LAZY:
+    Data transfer is scheduled when the destination node is ready to execute the consumer task.
+
+  - PREFETCH:
+    Data transfer is scheduled when the destination node is ready to execute a task
+    immediately preceding the consumer task.
+
+  - QUEUE:
+    Data transfers on each destination node are scheduled sequentially in the order of planned execution
+    of consumer tasks on this node.
+
+  - QUEUE_ECT:
+    Data transfers on each destination node are scheduled sequentially in the order of expected completion time
+    of producer tasks, breaking the ties with the order of planned execution of consumer tasks.
+
+  - PARENTS:
+    Data transfer is scheduled when all parents of the consumer task are completed.
+
+  - LAZY_PARENTS:
+    Combination of LAZY and PARENTS strategies.
+  """
+  EAGER = 1
+  LAZY = 2
+  PREFETCH = 3
+  QUEUE = 4
+  QUEUE_ECT = 5
+  PARENTS = 6
+  LAZY_PARENTS = 7
+
 
 class Scheduler(six.with_metaclass(abc.ABCMeta)):
   """
@@ -48,6 +106,21 @@ class Scheduler(six.with_metaclass(abc.ABCMeta)):
     """
     self._simulation = simulation
     self._log = logging.getLogger(type(self).__name__)
+
+    # Task execution and data transfer modes are configured via environment variables.
+    if "PYSIMGRID_TASK_EXECUTION" in os.environ:
+      self._task_exec_mode = TaskExecutionMode[os.environ["PYSIMGRID_TASK_EXECUTION"]]
+    else:
+      self._task_exec_mode = TaskExecutionMode.SEQUENTIAL
+    if "PYSIMGRID_DATA_TRANSFER" in os.environ:
+      self._data_transfer_mode = DataTransferMode[os.environ["PYSIMGRID_DATA_TRANSFER"]]
+    else:
+      self._data_transfer_mode = DataTransferMode.EAGER
+
+    algo = type(self).__name__
+    if self._data_transfer_mode == DataTransferMode.QUEUE_ECT:
+      if algo not in ['HEFT', 'Lookahead']:
+        raise Exception('%s does not support %s mode' % (algo, self._data_transfer_mode))
 
   @abc.abstractmethod
   def run(self):
@@ -118,14 +191,14 @@ class StaticScheduler(Scheduler):
     start_time = time.time()
     schedule = self.get_schedule(self._simulation)
     self.__scheduler_time = time.time() - start_time
-    self._log.info("Scheduling time: %f", self.__scheduler_time)
+    self._log.debug("Scheduling time: %f", self.__scheduler_time)
     if not isinstance(schedule, (dict, tuple)):
       raise Exception("'get_schedule' must return a dictionary or a tuple")
     if isinstance(schedule, tuple):
       if len(schedule) != 2 or not isinstance(schedule[0], dict) or not isinstance(schedule[1], float):
-        raise Exception("'get_schedule' returned tuple should have format (<expected_makespan>, <schedule>)")
+        raise Exception("'get_schedule' returned tuple should have format (<schedule>, <expected_makespan>)")
       schedule, self.__expected_makespan = schedule
-      self._log.info("Expected makespan: %f", self.__expected_makespan)
+      self._log.debug("Expected makespan: %f", self.__expected_makespan)
     for host, task_list in schedule.items():
       if not (isinstance(host, cplatform.Host) and isinstance(task_list, list)):
         raise Exception("'get_schedule' must return a dictionary Host:List_of_tasks")
@@ -136,38 +209,104 @@ class StaticScheduler(Scheduler):
     if len(unscheduled) != len(self._simulation.tasks):
       raise Exception("static scheduler should not directly schedule tasks")
 
-    hosts_status = {h: True for h in self._simulation.hosts}
+    # schedule tasks according to task execution and data transfer modes
+    for host, tasks in schedule.items():
+      if self._data_transfer_mode in [DataTransferMode.QUEUE, DataTransferMode.QUEUE_ECT]:
+        data_transfers = []
 
-    for t in self._simulation.tasks:
-      t.watch(csimdag.TASK_STATE_DONE)
+      for pos, task in enumerate(tasks):
+        task.schedule(host)
 
-    changed = self._simulation.tasks.by_func(lambda t: False)
-    while True:
+        # do not add any constraints for boundary tasks
+        if task.name in self.BOUNDARY_TASKS:
+          continue
 
-      # TODO: implement proper debugging
-      # print("%.6f ------------------------------------------------------------------" % self._simulation.clock)
-      # for task in changed:
-      #   if task.kind == csimdag.TASK_KIND_COMP_SEQ:
-      #     if task.state == csimdag.TASK_STATE_DONE:
-      #       print("%20s: %s (%s, %.6f - %.6f)" % (task.name, str(task.state), task.hosts[0].name,
-      #                                           task.start_time, task.finish_time))
-      #     else:
-      #       print("%20s: %s (%s, %.6f)" % (task.name, str(task.state), task.hosts[0].name, task.start_time))
-      #   else:
-      #     if task.state == csimdag.TASK_STATE_DONE:
-      #       print("%20s: %s (%s - %s, %.6f - %.6f)" % (task.name, str(task.state),
-      #                                                  task.hosts[0].name, task.hosts[1].name,
-      #                                                  task.start_time, task.finish_time))
-      #     else:
-      #       print("%20s: %s (%s - %s, %.6f)" % (task.name, str(task.state), task.hosts[0].name, task.hosts[1].name,
-      #                                           task.start_time))
+        # do not add any constraints for PARALLEL mode
+        if self._task_exec_mode == TaskExecutionMode.PARALLEL:
+          continue
 
-      self.__update_host_status(hosts_status, changed)
-      self.__schedule_to_free_hosts(schedule, hosts_status)
-      changed = self._simulation.simulate()
-      if not changed:
-        break
+        prev_task = schedule[host][pos - 1] if pos > 0 else None
+        prev2_task = schedule[host][pos - 2] if pos > 1 else None
 
+        # SEQUENTIAL task execution mode:
+        # forbid task overlapping by adding dependency on previous task
+        if prev_task is not None:
+          parent_tasks = set()
+          for comm in task.parents[csimdag.TaskKind.TASK_KIND_COMM_E2E]:
+            parent_tasks.add(comm.parents[0])
+          if prev_task not in parent_tasks:
+            self._simulation.add_dependency(prev_task, task)
+
+        # data transfer modes
+        if self._data_transfer_mode == DataTransferMode.EAGER:
+          # no additional dependencies are needed
+          pass
+        elif self._data_transfer_mode in [DataTransferMode.LAZY, DataTransferMode.LAZY_PARENTS]:
+          # add dependency from previous task to input data transfer
+          if prev_task is not None:
+            for comm in task.parents[csimdag.TaskKind.TASK_KIND_COMM_E2E]:
+              if comm.parents[0] != prev_task:
+                self._simulation.add_dependency(prev_task, comm)
+        elif self._data_transfer_mode == DataTransferMode.PREFETCH:
+          # add dependency from previous task data transfer to input data transfer
+          if prev_task is not None:
+            for comm in task.parents[csimdag.TaskKind.TASK_KIND_COMM_E2E]:
+              for prev_comm in prev_task.parents[csimdag.TaskKind.TASK_KIND_COMM_E2E]:
+                self._simulation.add_dependency(prev_comm, comm)
+          # add dependency from pre-previous task to input data transfer
+          # (this ensures that data transfer starts only when previous task is ready to run!)
+          if prev2_task is not None:
+            for comm in task.parents[csimdag.TaskKind.TASK_KIND_COMM_E2E]:
+              if comm.parents[0] != prev2_task:
+                self._simulation.add_dependency(prev2_task, comm)
+        elif self._data_transfer_mode == DataTransferMode.QUEUE:
+          # build a list of host inbound data transfers
+          for comm in task.parents[csimdag.TaskKind.TASK_KIND_COMM_E2E]:
+            data_transfers.append((comm, pos))
+        elif self._data_transfer_mode == DataTransferMode.QUEUE_ECT:
+          # build a list of host inbound data transfers
+          for comm in task.parents[csimdag.TaskKind.TASK_KIND_COMM_E2E]:
+            data_transfers.append((comm, (comm.parents[0].data["ect"], pos)))
+
+      if self._data_transfer_mode in [DataTransferMode.QUEUE, DataTransferMode.QUEUE_ECT]:
+        # form a queue from host inbound data transfers
+        data_transfers.sort(key=lambda t: t[1])
+        prev_comm = None
+        for comm, _ in data_transfers:
+          if prev_comm is not None:
+            self._simulation.add_dependency(prev_comm, comm)
+          prev_comm = comm
+
+    # PARENTS / LAZY_PARENTS modes
+    # (separate loop to avoid breaking the data transfers)
+    if self._data_transfer_mode in [DataTransferMode.PARENTS, DataTransferMode.LAZY_PARENTS]:
+      for host, tasks in schedule.items():
+        for pos, task in enumerate(tasks):
+          if task.name in self.BOUNDARY_TASKS:
+            continue
+          if self._task_exec_mode == TaskExecutionMode.PARALLEL:
+            continue
+          # add dependency from parents to input data transfers
+          for comm in task.parents[csimdag.TaskKind.TASK_KIND_COMM_E2E]:
+            for comm2 in task.parents[csimdag.TaskKind.TASK_KIND_COMM_E2E]:
+              if comm2 != comm:
+                parent = comm2.parents[0]
+                if comm.parents[0] != parent:
+                  self._simulation.add_dependency(parent, comm)
+
+    # make sure that our manipulations with dependencies do not break the data transfers
+    for task in self._simulation.tasks:
+      task_host = task.hosts[0]
+      for comm in task.parents[csimdag.TaskKind.TASK_KIND_COMM_E2E]:
+        parent_task = comm.parents[0]
+        parent_task_host = parent_task.hosts[0]
+        src = comm.hosts[0]
+        dst = comm.hosts[1] if len(comm.hosts) == 2 else src
+        if src != parent_task_host or dst != task_host:
+          raise Exception("Sanity check FAILED! Data transfer: %s [%s] -> %s [%s] has wrong hosts: %s -> %s"
+                          % (parent_task.name, parent_task_host.name, task.name, task_host.name, src.name, dst.name))
+
+    self._simulation.simulate()
     self._check_done()
     self.__total_time = time.time() - start_time
 
@@ -198,18 +337,6 @@ class StaticScheduler(Scheduler):
   def expected_makespan(self):
     return self.__expected_makespan
 
-  def __update_host_status(self, hosts_status, changed):
-    for t in changed.by_prop("kind", csimdag.TASK_KIND_COMM_E2E, True)[csimdag.TASK_STATE_DONE]:
-      for h in t.hosts:
-        hosts_status[h] = True
-
-  def __schedule_to_free_hosts(self, schedule, hosts_status):
-    for host, tasks in schedule.items():
-      if tasks and hosts_status[host] == True:
-        task = tasks.pop(0)
-        task.schedule(host)
-        hosts_status[host] = False
-
 
 class DynamicScheduler(Scheduler):
   """
@@ -231,25 +358,6 @@ class DynamicScheduler(Scheduler):
     self.__scheduler_time = time.time() - scheduler_time
     changed = self._simulation.simulate()
     while changed:
-
-      # TODO: implement proper debugging
-      # print("%.6f ------------------------------------------------------------------" % self._simulation.clock)
-      # for task in changed:
-      #   if task.kind == csimdag.TASK_KIND_COMP_SEQ:
-      #     if task.state == csimdag.TASK_STATE_DONE:
-      #       print("%20s: %s (%s, %.6f - %.6f)" % (task.name, str(task.state), task.hosts[0].name,
-      #                                           task.start_time, task.finish_time))
-      #     else:
-      #       print("%20s: %s (%s, %.6f)" % (task.name, str(task.state), task.hosts[0].name, task.start_time))
-      #   else:
-      #     if task.state == csimdag.TASK_STATE_DONE:
-      #       print("%20s: %s (%s - %s, %.6f - %.6f)" % (task.name, str(task.state),
-      #                                                  task.hosts[0].name, task.hosts[1].name,
-      #                                                  task.start_time, task.finish_time))
-      #     else:
-      #       print("%20s: %s (%s - %s, %.6f)" % (task.name, str(task.state), task.hosts[0].name, task.hosts[1].name,
-      #                                           task.start_time))
-
       scheduler_time = time.time()
       self.schedule(self._simulation, changed)
       self.__scheduler_time += time.time() - scheduler_time

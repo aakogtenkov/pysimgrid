@@ -58,6 +58,38 @@ def _get_done_tasks(schedule):
             done_tasks.add(task)
     return done_tasks
 
+def _virtual_schedule_execution(schedule, task_graph, tasks_status, platform_model, updated_tasks=set()):
+    # running and done tasks have up-to-date information about EFT
+    if len(updated_tasks) == 0:
+        for host in schedule.get_schedule().keys():
+            for task, start_time, end_time in schedule.get_schedule()[host]:
+                if tasks_status[task][0] == 'running' or tasks_status[task][0] == 'done':
+                    updated_tasks.add(task)
+    # update tasks EFT one by one for each host
+    at_least_one_updated = True
+    cur_indices = {host: 0 for host in schedule.get_schedule().keys()}
+    while at_least_one_updated:
+        at_least_one_updated = False
+        for host in schedule.get_schedule().keys():
+            if cur_indices[host] < len(schedule.get_schedule()[host]):
+                task, _, _ = schedule.get_schedule()[host][cur_indices[host]]
+                all_parents_updated = True
+                for parent, edge_dict in dict(task_graph.pred[task]).items():
+                    if not parent in updated_tasks:
+                        all_parents_updated = False
+                if all_parents_updated:
+                    at_least_one_updated = True
+                    updated_tasks.add(task)
+                    parents_eft = _all_parents_done_time(dict(task_graph.pred[task]), tasks_status)
+                    transmission_time = _comm_time(host, dict(task_graph.pred[task]), platform_model, tasks_status)
+                    eet = platform_model.eet(task, host)
+                    if cur_indices[host] > 0:
+                        prev_task, _, _ = schedule.get_schedule()[host][cur_indices[host] - 1]
+                        parents_eft = max(parents_eft, tasks_status[prev_task][2])
+                    tasks_status[task] = (tasks_status[task][0], tasks_status[task][1], parents_eft + transmission_time + eet)
+                    cur_indices[host] += 1
+    return
+
 
 class Schedule():
     def __init__(self, hosts):
@@ -98,7 +130,7 @@ class StepTrigger():
             return True
         return False
 
-class ParallelTrigger(StepTrigger):
+class ParallelTrigger():
     def __init__(self, steps=1):
         self.c = steps + 1
         self.steps = steps
@@ -111,6 +143,58 @@ class ParallelTrigger(StepTrigger):
         if self.c > self.steps:
             self.c = 1
             return True
+        return False
+
+class BlockTrigger():
+    def __init__(self, simulation):
+        self.graph = simulation.get_task_graph()
+        self.simulation = simulation
+        self.graph_to_layers()
+        self.cur_level = -1
+
+    def graph_to_layers(self):
+        self.task_levels = {t: None for t in self.simulation.tasks}
+        max_layer_num = 0
+        while None in self.task_levels.values():
+            for task in self.simulation.tasks:
+                if self.task_levels[task] is not None:
+                    continue
+                max_level = 0
+                for parent, edge_dict in dict(self.graph.pred[task]).items():
+                    if max_level is not None and self.task_levels[parent] is not None:
+                        max_level = max(max_level, self.task_levels[parent] + 1)
+                    else:
+                        max_level = None
+                if max_level is not None:
+                    self.task_levels[task] = max_level
+                    max_layer_num = max(max_level, max_layer_num)
+        self.layers = [[] for _ in range(max_layer_num + 1)]
+        '''for i in range(max_layer_num + 1):
+            print(i)
+            for task in self.task_levels:
+                if self.task_levels[task] == i:
+                    self.layers[i].append(task)
+                    print(task.name, end=' ')
+            print()'''
+
+    def get_graph_layers(self):
+        return self.layers
+
+    def get_level_to_schedule(self):
+        return self.cur_level
+
+    def get_task_levels(self):
+        return self.task_levels
+
+    def trigger(self, tasks_status):
+        if self.cur_level < 0:
+            self.cur_level = 0
+            return True
+        for task in tasks_status:
+            if ((tasks_status[task][0] == 'running' or tasks_status[task][0] == 'done') and 
+                self.cur_level <= self.task_levels[task]):
+                self.cur_level += 1
+                return True
         return False
 
 
@@ -130,11 +214,12 @@ class SimpleSchedulePartitioner():
 class ParallelSchedulePartitioner():
     # Warning: this partitioner returns final schedule!
 
-    def __init__(self, scheduler, simulation):
+    def __init__(self, scheduler, simulation, min_start_time):
         self.scheduler = scheduler
         self.simulation = simulation
+        self.min_start_time = min_start_time
 
-    def freeze(self, schedule, tasks_status, hosts_status, task_graph, min_start_time=0):
+    def freeze(self, schedule, tasks_status, hosts_status, task_graph):
         new_schedule = Schedule(schedule.get_schedule().keys())
         scheduled_tasks = set()
 
@@ -142,7 +227,7 @@ class ParallelSchedulePartitioner():
         for host in schedule.get_schedule().keys():
             for task, start_time, end_time in schedule.get_schedule()[host]:
                 status, h, ect = tasks_status[task]
-                if status == 'running' or status == 'done' or start_time < min_start_time:
+                if status == 'running' or status == 'done' or start_time < self.simulation.clock + self.min_start_time:
                     new_schedule._append(task, host, -1, ect)
                     scheduled_tasks.add(task)
 
@@ -154,7 +239,7 @@ class ParallelSchedulePartitioner():
         # adding rescheduling task
         for host in schedule.get_schedule().keys():
             if cscheduling.is_master_host(host):
-                rescheduling_task = self.simulation.add_task("rescheduling" + str(start_time), 1)   # default amount, should be replaced in future
+                rescheduling_task = self.simulation.add_task("rescheduling" + str(start_time), 0)   # default amount, should be replaced in future
                 for task in self.simulation.tasks:
                     if not task in scheduled_tasks and task != rescheduling_task and task.name != 'root':
                         #print(task.name)
@@ -169,6 +254,22 @@ class ParallelSchedulePartitioner():
         #    for task, _, _ in new_schedule._schedule[host]:
         #        print([_t for _t in self.simulation.tasks].index(task), [_h for _h in self.simulation.hosts].index(host))
         return new_schedule
+
+class BlockPartitioner():
+    def __init__(self, simulation, block_trigger):
+        self.block_trigger = block_trigger
+
+    def freeze(self, schedule, tasks_status, hosts_status, task_graph):
+        new_schedule = Schedule(schedule.get_schedule().keys())
+        layer_to_schedule = self.block_trigger.get_level_to_schedule()
+        task_levels = self.block_trigger.get_task_levels()
+        for host in schedule.get_schedule().keys():
+            for task, start_time, end_time in schedule.get_schedule()[host]:
+                status, h, ect = tasks_status[task]
+                if task_levels[task] < layer_to_schedule or tasks_status[task][0] == 'done' or tasks_status[task][0] == 'running':
+                    new_schedule._append(task, host, -1, ect)
+        return new_schedule
+
 
 
 class DynamicWrapper(scheduler.DynamicScheduler):
@@ -190,7 +291,8 @@ class DynamicWrapper(scheduler.DynamicScheduler):
         self.__update_host_status(changed)
         reschedule = self.trigger.trigger(self.tasks_status)
         if reschedule:
-            self._schedule = self.schedule_partitioner.freeze(self._schedule, self.tasks_status, self.hosts_status, self.task_graph, 10)
+            self._schedule = self.schedule_partitioner.freeze(self._schedule, self.tasks_status, self.hosts_status, self.task_graph)
+            _virtual_schedule_execution(self._schedule, self.task_graph, self.tasks_status, cscheduling.PlatformModel(self._simulation))
             self.task_graph = self._simulation.get_task_graph() # for parallel partitioner that adds new task
             self._schedule, expected_makespan = self.static_scheduler.get_schedule(self._schedule, 
                                                                                    self.task_graph, 
@@ -218,6 +320,8 @@ class DynamicWrapper(scheduler.DynamicScheduler):
                                     _comm_time(host, dict(self.task_graph[task]), self.platform_model, self.tasks_status))
                         self.tasks_status[task] = ('running', host, end_time)
                         #print(host, [_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host), self._simulation.clock)
+                        break
+                    else:
                         break
 
 
@@ -268,9 +372,11 @@ class DynamicHEFT(scheduler.StaticScheduler):
                 #print([_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host_to_schedule), best_start, best_eft)
         #print()
         #print(expected_makespan)
-        #for host in schedule:
-        #    for task in schedule[host]:
-        #        print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host))
+        '''for host in self._simulation.hosts:
+            for task, start, end in schedule.get_schedule()[host]:
+                if start != -1:
+                    print(task.name, [_h for _h in self._simulation.hosts].index(host), start, end)'''
+        #print(expected_makespan)
         return schedule, expected_makespan
 
 class DynamicHEFT_reschedule_inf(DynamicWrapper):
@@ -293,6 +399,27 @@ class DynamicHEFT_reschedule_5(DynamicWrapper):
         trigger = StepTrigger(5)
         schedule_partitioner = SimpleSchedulePartitioner()
         super(DynamicHEFT_reschedule_5, self).__init__(simulation, static_scheduler, trigger, schedule_partitioner)
+
+class DynamicHEFT_block(DynamicWrapper):
+    def __init__(self, simulation):
+        static_scheduler = DynamicHEFT(simulation)
+        trigger = BlockTrigger(simulation)
+        schedule_partitioner = BlockPartitioner(simulation, trigger)
+        super(DynamicHEFT_block, self).__init__(simulation, static_scheduler, trigger, schedule_partitioner)
+
+class DynamicHEFT_parallel_5_8(DynamicWrapper):
+    def __init__(self, simulation):
+        static_scheduler = DynamicHEFT(simulation)
+        trigger = ParallelTrigger(5)
+        schedule_partitioner = ParallelSchedulePartitioner(static_scheduler, simulation, 8)
+        super(DynamicHEFT_parallel_5_8, self).__init__(simulation, static_scheduler, trigger, schedule_partitioner)
+
+class DynamicHEFT_parallel_5_4(DynamicWrapper):
+    def __init__(self, simulation):
+        static_scheduler = DynamicHEFT(simulation)
+        trigger = ParallelTrigger(5)
+        schedule_partitioner = ParallelSchedulePartitioner(static_scheduler, simulation, 4)
+        super(DynamicHEFT_parallel_5_4, self).__init__(simulation, static_scheduler, trigger, schedule_partitioner)
 
 
 class DynamicLookahead(scheduler.StaticScheduler):
@@ -475,6 +602,13 @@ class DynamicPEFT(scheduler.StaticScheduler):
             result[task] = oct_row
         return result
 
+class DynamicPEFT_reschedule_inf(DynamicWrapper):
+    def __init__(self, simulation):
+        static_scheduler = DynamicPEFT(simulation)
+        trigger = StepTrigger(100000)
+        schedule_partitioner = SimpleSchedulePartitioner()
+        super(DynamicPEFT_reschedule_inf, self).__init__(simulation, static_scheduler, trigger, schedule_partitioner)
+
 
 class DynamicHCPT(scheduler.StaticScheduler):
     def __init__(self, simulation):
@@ -609,6 +743,13 @@ class DynamicHCPT(scheduler.StaticScheduler):
 
         return aest, alst
 
+class DynamicHCPT_reschedule_inf(DynamicWrapper):
+    def __init__(self, simulation):
+        static_scheduler = DynamicHCPT(simulation)
+        trigger = StepTrigger(100000)
+        schedule_partitioner = SimpleSchedulePartitioner()
+        super(DynamicHCPT_reschedule_inf, self).__init__(simulation, static_scheduler, trigger, schedule_partitioner)
+
 
 class DynamicDLS(scheduler.StaticScheduler):
     def __init__(self, simulation):
@@ -724,3 +865,185 @@ class DynamicDLS(scheduler.StaticScheduler):
                 sl[parent] = max(sl[parent], sl[task] + aec[parent])
 
         return aec, sl
+
+
+class DynamicHEFT_CS(scheduler.StaticScheduler):
+    def __init__(self, simulation):
+        super(DynamicHEFT_CS, self).__init__(simulation)
+        self.ordered_tasks = None
+        self.task_ranks = None
+
+    def calc_ranks(self, nxgraph, platform_model):
+        mean_speed = platform_model.mean_speed
+        mean_bandwidth = platform_model.mean_bandwidth
+        mean_latency = platform_model.mean_latency
+        task_ranku = dict()
+        for idx, task in enumerate(list(reversed(list(networkx.topological_sort(nxgraph))))):
+            ecomt_and_rank = [
+            task_ranku[child] + (edge["weight"] / mean_bandwidth + mean_latency)
+            for child, edge in nxgraph[task].items()
+            ] or [0]
+            task_ranku[task] = task.amount / mean_speed + max(ecomt_and_rank) + 1
+        # use node name as an additional sort condition to deal with zero-weight tasks (e.g. root)
+        return task_ranku
+
+    def get_schedule(self, schedule, task_graph, tasks_status):
+
+        platform_model = cscheduling.PlatformModel(self._simulation)
+        state = cscheduling.SchedulerState(self._simulation)
+
+        if self.ordered_tasks is None:
+            self.ordered_tasks = cscheduling.heft_order(task_graph, platform_model)
+            self.task_ranks = self.calc_ranks(task_graph, platform_model)
+
+        done_tasks = _get_done_tasks(schedule)
+
+        expected_makespan = self._simulation.clock
+
+        for task in self.ordered_tasks:
+            if not task in done_tasks:
+                best_eft = None
+                host_to_schedule = None
+                best_start = None
+                best_pos = None
+                best_ct = None
+                for host in self._simulation.hosts:
+                    if task.name != 'root' and task.name != 'end' and cscheduling.is_master_host(host):
+                        continue
+                    if (task.name == 'root' or task.name == 'end') and not(cscheduling.is_master_host(host)):
+                        continue
+                    parents_eft = _all_parents_done_time(dict(task_graph.pred[task]), tasks_status)
+                    parents_eft = max(self._simulation.clock, parents_eft)
+                    transmission_time = _comm_time(host, dict(task_graph.pred[task]), platform_model, tasks_status)
+                    eet = platform_model.eet(task, host)
+
+                    pos, time_start, eft = schedule.timesheet_insertion_place(host, parents_eft, transmission_time + eet)
+
+                    ct = 0
+                    for edge in task_graph.edges():
+                        if edge[0] == task:
+                            weight = task_graph.get_edge_data(edge[0], edge[1])['weight']
+                            ct = max(self.task_ranks[task] + weight / platform_model.mean_bandwidth + platform_model.mean_latency, ct)
+                    ct += eft
+
+                    if host_to_schedule is None or best_ct > ct:
+                        best_eft = eft
+                        host_to_schedule = host
+                        best_start = time_start
+                        best_pos = pos
+                        best_ct = ct
+                #
+                schedule.insert_into_schedule(task, host_to_schedule, best_pos, best_start, best_eft)
+                tasks_status[task] = ('scheduled', host_to_schedule, best_eft)
+                expected_makespan = max(expected_makespan, best_eft)
+                
+                #print([_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host_to_schedule), best_start, best_eft)
+        #print()
+        #print(expected_makespan)
+        #for host in schedule:
+        #    for task in schedule[host]:
+        #        print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host))
+        return schedule, expected_makespan
+
+class DynamicHEFT_CS_block(DynamicWrapper):
+    def __init__(self, simulation):
+        static_scheduler = DynamicHEFT_CS(simulation)
+        trigger = BlockTrigger(simulation)
+        schedule_partitioner = BlockPartitioner(simulation, trigger)
+        super(DynamicHEFT_CS_block, self).__init__(simulation, static_scheduler, trigger, schedule_partitioner)
+
+
+class DynamicHEFT_CD(scheduler.StaticScheduler):
+    def __init__(self, simulation):
+        super(DynamicHEFT_CD, self).__init__(simulation)
+        self.ordered_tasks = None
+        self.task_ranks = None
+
+    def sort_tasks(self, task_ranks):
+        ordered_tasks = []
+        for task in task_ranks:
+            ordered_tasks.append((task_ranks[task], task))
+        ordered_tasks.sort(reverse=True)
+        for i in range(len(ordered_tasks)):
+            ordered_tasks[i] = ordered_tasks[i][1]
+        return ordered_tasks
+
+    def calc_ranks(self, nxgraph, platform_model):
+        mean_speed = platform_model.mean_speed
+        mean_bandwidth = platform_model.mean_bandwidth
+        mean_latency = platform_model.mean_latency
+        task_ranku = dict()
+        for idx, task in enumerate(list(reversed(list(networkx.topological_sort(nxgraph))))):
+            ecomt_and_rank = [
+            task_ranku[child] + (edge["weight"] / mean_bandwidth + mean_latency)
+            for child, edge in nxgraph[task].items()
+            ] or [0]
+            task_ranku[task] = task.amount / mean_speed + max(ecomt_and_rank) + 1
+        # use node name as an additional sort condition to deal with zero-weight tasks (e.g. root)
+        return task_ranku
+
+    def get_schedule(self, schedule, task_graph, tasks_status):
+
+        platform_model = cscheduling.PlatformModel(self._simulation)
+        state = cscheduling.SchedulerState(self._simulation)
+
+        if self.ordered_tasks is None:
+            self.ordered_tasks = cscheduling.heft_order(task_graph, platform_model)
+            self.task_ranks = self.calc_ranks(task_graph, platform_model)
+
+        done_tasks = _get_done_tasks(schedule)
+
+        expected_makespan = self._simulation.clock
+
+        for task in self.ordered_tasks:
+            if not task in done_tasks:
+                best_eft = None
+                host_to_schedule = None
+                best_start = None
+                best_pos = None
+                best_ct = None
+                for host in self._simulation.hosts:
+                    if task.name != 'root' and task.name != 'end' and cscheduling.is_master_host(host):
+                        continue
+                    if (task.name == 'root' or task.name == 'end') and not(cscheduling.is_master_host(host)):
+                        continue
+                    parents_eft = _all_parents_done_time(dict(task_graph.pred[task]), tasks_status)
+                    parents_eft = max(self._simulation.clock, parents_eft)
+                    transmission_time = _comm_time(host, dict(task_graph.pred[task]), platform_model, tasks_status)
+                    eet = platform_model.eet(task, host)
+
+                    pos, time_start, eft = schedule.timesheet_insertion_place(host, parents_eft, transmission_time + eet)
+
+                    ct = 0
+                    for edge in task_graph.edges():
+                        if edge[0] == task:
+                            weight = task_graph.get_edge_data(edge[0], edge[1])['weight']
+                            ct = max(self.task_ranks[task] + weight / platform_model.mean_bandwidth + platform_model.mean_latency, ct)
+                    ct += eft
+
+                    if host_to_schedule is None or best_ct > ct:
+                        best_eft = eft
+                        host_to_schedule = host
+                        best_start = time_start
+                        best_pos = pos
+                        best_ct = ct
+                self.task_ranks[task] = best_ct
+                #
+                schedule.insert_into_schedule(task, host_to_schedule, best_pos, best_start, best_eft)
+                tasks_status[task] = ('scheduled', host_to_schedule, best_eft)
+                expected_makespan = max(expected_makespan, best_eft)
+        self.ordered_tasks = self.sort_tasks(self.task_ranks)
+                #print([_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host_to_schedule), best_start, best_eft)
+        #print()
+        #print(expected_makespan)
+        #for host in schedule:
+        #    for task in schedule[host]:
+        #        print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host))
+        return schedule, expected_makespan
+
+class DynamicHEFT_CD_block(DynamicWrapper):
+    def __init__(self, simulation):
+        static_scheduler = DynamicHEFT_CD(simulation)
+        trigger = BlockTrigger(simulation)
+        schedule_partitioner = BlockPartitioner(simulation, trigger)
+        super(DynamicHEFT_CD_block, self).__init__(simulation, static_scheduler, trigger, schedule_partitioner)

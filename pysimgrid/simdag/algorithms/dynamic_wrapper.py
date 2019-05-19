@@ -169,13 +169,6 @@ class BlockTrigger():
                     self.task_levels[task] = max_level
                     max_layer_num = max(max_level, max_layer_num)
         self.layers = [[] for _ in range(max_layer_num + 1)]
-        '''for i in range(max_layer_num + 1):
-            print(i)
-            for task in self.task_levels:
-                if self.task_levels[task] == i:
-                    self.layers[i].append(task)
-                    print(task.name, end=' ')
-            print()'''
 
     def get_graph_layers(self):
         return self.layers
@@ -190,12 +183,13 @@ class BlockTrigger():
         if self.cur_level < 0:
             self.cur_level = 0
             return True
+        flag = False
         for task in tasks_status:
             if ((tasks_status[task][0] == 'running' or tasks_status[task][0] == 'done') and 
                 self.cur_level <= self.task_levels[task]):
-                self.cur_level += 1
-                return True
-        return False
+                self.cur_level = self.task_levels[task] + 1
+                flag = True
+        return flag
 
 
 class SimpleSchedulePartitioner():
@@ -249,10 +243,7 @@ class ParallelSchedulePartitioner():
                 new_schedule._append(rescheduling_task, host, -1, self.simulation.clock)
                 tasks_status[rescheduling_task] = ('scheduled', host, self.simulation.clock)
                 break
-        
-        #for host in new_schedule._schedule:
-        #    for task, _, _ in new_schedule._schedule[host]:
-        #        print([_t for _t in self.simulation.tasks].index(task), [_h for _h in self.simulation.hosts].index(host))
+
         return new_schedule
 
 class BlockPartitioner():
@@ -292,8 +283,8 @@ class DynamicWrapper(scheduler.DynamicScheduler):
         reschedule = self.trigger.trigger(self.tasks_status)
         if reschedule:
             self._schedule = self.schedule_partitioner.freeze(self._schedule, self.tasks_status, self.hosts_status, self.task_graph)
-            _virtual_schedule_execution(self._schedule, self.task_graph, self.tasks_status, cscheduling.PlatformModel(self._simulation))
             self.task_graph = self._simulation.get_task_graph() # for parallel partitioner that adds new task
+            _virtual_schedule_execution(self._schedule, self.task_graph, self.tasks_status, cscheduling.PlatformModel(self._simulation))
             self._schedule, expected_makespan = self.static_scheduler.get_schedule(self._schedule, 
                                                                                    self.task_graph, 
                                                                                    self.tasks_status)
@@ -321,7 +312,7 @@ class DynamicWrapper(scheduler.DynamicScheduler):
                         self.tasks_status[task] = ('running', host, end_time)
                         #print(host, [_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host), self._simulation.clock)
                         break
-                    else:
+                    elif not(cscheduling.is_master_host(host)):
                         break
 
 
@@ -368,15 +359,7 @@ class DynamicHEFT(scheduler.StaticScheduler):
                 schedule.insert_into_schedule(task, host_to_schedule, best_pos, best_start, best_eft)
                 tasks_status[task] = ('scheduled', host_to_schedule, best_eft)
                 expected_makespan = max(expected_makespan, best_eft)
-                
-                #print([_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host_to_schedule), best_start, best_eft)
-        #print()
-        #print(expected_makespan)
-        '''for host in self._simulation.hosts:
-            for task, start, end in schedule.get_schedule()[host]:
-                if start != -1:
-                    print(task.name, [_h for _h in self._simulation.hosts].index(host), start, end)'''
-        #print(expected_makespan)
+
         return schedule, expected_makespan
 
 class DynamicHEFT_reschedule_inf(DynamicWrapper):
@@ -482,10 +465,6 @@ class DynamicLookahead(scheduler.StaticScheduler):
 
                     _, _expected_makespan = self.heft.get_schedule(schedule_copy, task_graph, tasks_status_copy)
 
-                    #for task in tasks_status_copy:
-                    #    print(tasks_status_copy[task], _expected_makespan)
-                    #print(_expected_makespan, [_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host))
-
                     if host_to_schedule is None or _expected_makespan < best_expected_makespan:
                         best_eft = eft
                         host_to_schedule = host
@@ -496,17 +475,7 @@ class DynamicLookahead(scheduler.StaticScheduler):
                 schedule.insert_into_schedule(task, host_to_schedule, best_pos, best_start, best_eft)
                 tasks_status[task] = ('scheduled', host_to_schedule, best_eft)
                 expected_makespan = max(expected_makespan, best_eft)
-                #print(best_eft, best_expected_makespan, [_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host_to_schedule))
 
-                #print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host_to_schedule))
-                #for parent, edge_dict in dict(nxgraph.pred[task]).items():
-                #    print([_t for _t in simulation.tasks].index(parent), edge_dict['weight'], tasks_ect[parent])
-                #print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host_to_schedule), best_start, best_eft, best_expected_makespan)
-        #print()
-        #print(expected_makespan)
-        #for host in schedule:
-        #    for task in schedule[host]:
-        #        print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host))
         return schedule, expected_makespan
 
 class DynamicLookahead_reschedule_inf(DynamicWrapper):
@@ -564,13 +533,7 @@ class DynamicPEFT(scheduler.StaticScheduler):
                 schedule.insert_into_schedule(task, host_to_schedule, best_pos, best_start, best_eft)
                 tasks_status[task] = ('scheduled', host_to_schedule, best_eft)
                 expected_makespan = max(expected_makespan, best_eft)
-                
-                #print([_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host_to_schedule), best_start, best_eft)
-        #print()
-        #print(expected_makespan)
-        #for host in schedule:
-        #    for task in schedule[host]:
-        #        print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host))
+
         return schedule, expected_makespan
 
     @classmethod
@@ -608,6 +571,13 @@ class DynamicPEFT_reschedule_inf(DynamicWrapper):
         trigger = StepTrigger(100000)
         schedule_partitioner = SimpleSchedulePartitioner()
         super(DynamicPEFT_reschedule_inf, self).__init__(simulation, static_scheduler, trigger, schedule_partitioner)
+
+class DynamicPEFT_reschedule_5(DynamicWrapper):
+    def __init__(self, simulation):
+        static_scheduler = DynamicPEFT(simulation)
+        trigger = StepTrigger(5)
+        schedule_partitioner = SimpleSchedulePartitioner()
+        super(DynamicPEFT_reschedule_5, self).__init__(simulation, static_scheduler, trigger, schedule_partitioner)
 
 
 class DynamicHCPT(scheduler.StaticScheduler):
@@ -654,12 +624,6 @@ class DynamicHCPT(scheduler.StaticScheduler):
                 tasks_status[task] = ('scheduled', host_to_schedule, best_eft)
                 expected_makespan = max(expected_makespan, best_eft)
                 
-                #print([_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host_to_schedule), best_start, best_eft)
-        #print()
-        #print(expected_makespan)
-        #for host in schedule:
-        #    for task in schedule[host]:
-        #        print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host))
         return schedule, expected_makespan
 
     def order_tasks(self, task_graph, platform_model):
@@ -750,6 +714,13 @@ class DynamicHCPT_reschedule_inf(DynamicWrapper):
         schedule_partitioner = SimpleSchedulePartitioner()
         super(DynamicHCPT_reschedule_inf, self).__init__(simulation, static_scheduler, trigger, schedule_partitioner)
 
+class DynamicHCPT_reschedule_5(DynamicWrapper):
+    def __init__(self, simulation):
+        static_scheduler = DynamicHCPT(simulation)
+        trigger = StepTrigger(5)
+        schedule_partitioner = SimpleSchedulePartitioner()
+        super(DynamicHCPT_reschedule_5, self).__init__(simulation, static_scheduler, trigger, schedule_partitioner)
+
 
 class DynamicDLS(scheduler.StaticScheduler):
     def __init__(self, simulation):
@@ -823,12 +794,6 @@ class DynamicDLS(scheduler.StaticScheduler):
             for task in queued_tasks:
                 dl[host_to_schedule][task] = self.calculate_dl(task_graph, tasks_status, platform_model, task, host_to_schedule, schedule)
 
-        #for host in self._simulation.hosts:
-        #    print([_t for _t in self._simulation.hosts].index(host), end=': ')
-        #    for task, _, _ in schedule._schedule[host]:
-        #        print([_t for _t in self._simulation.tasks].index(task), end=', ')
-        #    print()
-        #print(expected_makespan)
         return schedule, expected_makespan
 
     def calculate_dl(self, task_graph, tasks_status, platform_model, task, host, schedule):
@@ -865,6 +830,20 @@ class DynamicDLS(scheduler.StaticScheduler):
                 sl[parent] = max(sl[parent], sl[task] + aec[parent])
 
         return aec, sl
+
+class DynamicDLS_reschedule_inf(DynamicWrapper):
+    def __init__(self, simulation):
+        static_scheduler = DynamicDLS(simulation)
+        trigger = StepTrigger(100000)
+        schedule_partitioner = SimpleSchedulePartitioner()
+        super(DynamicDLS_reschedule_inf, self).__init__(simulation, static_scheduler, trigger, schedule_partitioner)
+
+class DynamicDLS_reschedule_5(DynamicWrapper):
+    def __init__(self, simulation):
+        static_scheduler = DynamicDLS(simulation)
+        trigger = StepTrigger(5)
+        schedule_partitioner = SimpleSchedulePartitioner()
+        super(DynamicDLS_reschedule_5, self).__init__(simulation, static_scheduler, trigger, schedule_partitioner)
 
 
 class DynamicHEFT_CS(scheduler.StaticScheduler):
@@ -936,13 +915,7 @@ class DynamicHEFT_CS(scheduler.StaticScheduler):
                 schedule.insert_into_schedule(task, host_to_schedule, best_pos, best_start, best_eft)
                 tasks_status[task] = ('scheduled', host_to_schedule, best_eft)
                 expected_makespan = max(expected_makespan, best_eft)
-                
-                #print([_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host_to_schedule), best_start, best_eft)
-        #print()
-        #print(expected_makespan)
-        #for host in schedule:
-        #    for task in schedule[host]:
-        #        print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host))
+
         return schedule, expected_makespan
 
 class DynamicHEFT_CS_block(DynamicWrapper):
@@ -1033,12 +1006,7 @@ class DynamicHEFT_CD(scheduler.StaticScheduler):
                 tasks_status[task] = ('scheduled', host_to_schedule, best_eft)
                 expected_makespan = max(expected_makespan, best_eft)
         self.ordered_tasks = self.sort_tasks(self.task_ranks)
-                #print([_t for _t in self._simulation.tasks].index(task), [_h for _h in self._simulation.hosts].index(host_to_schedule), best_start, best_eft)
-        #print()
-        #print(expected_makespan)
-        #for host in schedule:
-        #    for task in schedule[host]:
-        #        print([_t for _t in simulation.tasks].index(task), [_h for _h in simulation.hosts].index(host))
+ 
         return schedule, expected_makespan
 
 class DynamicHEFT_CD_block(DynamicWrapper):

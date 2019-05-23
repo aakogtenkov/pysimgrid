@@ -26,6 +26,8 @@ from .scheduler import TaskExecutionMode
 from .. import csimdag
 from .. import tools
 
+import numpy as np
+
 class Simulation(object):
   """
   High-level API for current simulation state.
@@ -106,7 +108,7 @@ class Simulation(object):
     Task computation/communication amounts are represented as an "weight" attribute of nodes and edges.
     """
     free_tasks = self.tasks.by_func(lambda t: not t.parents)
-    if len(free_tasks) != 1:
+    if len(free_tasks) < 1: # != replaced by < for parallel rescheduling
       raise Exception("cannot find DAG root")
 
     graph = networkx.DiGraph()
@@ -228,6 +230,7 @@ class Simulation(object):
     comm_tasks_count = len(self.connections)
     self._logger.debug("Tasks loaded, %d nodes, %d links", len(self._tasks) - comm_tasks_count, comm_tasks_count)
 
+    np.random.seed(1234) # stable seed for threading
     if self._estimator is not None:
       for task in self.tasks:
         if task.amount > 0:
